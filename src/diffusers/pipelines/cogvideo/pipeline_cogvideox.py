@@ -287,7 +287,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        if prompt_embeds is None:
+        if prompt_embeds is None: # 如果没有给模型已经算好的特征，则调用下面的函数，启动T5模型，文本分词—→文本编码
             prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=prompt,
                 num_videos_per_prompt=num_videos_per_prompt,
@@ -312,7 +312,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     " the batch size of `prompt`."
                 )
 
-            negative_prompt_embeds = self._get_t5_prompt_embeds(
+            negative_prompt_embeds = self._get_t5_prompt_embeds( # 开启cfg，将反向提示词送入T5，生成对应的反向特征向量
                 prompt=negative_prompt,
                 num_videos_per_prompt=num_videos_per_prompt,
                 max_sequence_length=max_sequence_length,
@@ -322,7 +322,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         return prompt_embeds, negative_prompt_embeds
 
-    def prepare_latents(
+    def prepare_latents( # 初始化纯噪声
         self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None
     ):
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -331,29 +331,29 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        shape = (
+        shape = ( # B, T, C, H, W, 在DiT中更符合NLP处理时时间序列优先的习惯
             batch_size,
-            (num_frames - 1) // self.vae_scale_factor_temporal + 1,
-            num_channels_latents,
-            height // self.vae_scale_factor_spatial,
-            width // self.vae_scale_factor_spatial,
+            (num_frames - 1) // self.vae_scale_factor_temporal + 1, # 锚点帧的影响
+            num_channels_latents, # 16
+            height // self.vae_scale_factor_spatial, # H维度下采样
+            width // self.vae_scale_factor_spatial, # W维度下采样
         )
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        if latents is None: # 输入的latents is None
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype) # torch.randn生成随机标准高斯噪声张量，均值0，方差1
         else:
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-        return latents
+        latents = latents * self.scheduler.init_noise_sigma # 不同schedule的初始状态分布是不同的
+        return latents 
 
-    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        latents = latents.permute(0, 2, 1, 3, 4)  # [batch_size, num_channels, num_frames, height, width]
-        latents = 1 / self.vae_scaling_factor_image * latents
+    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor: # nn.Conv3d算子，输入维度要求是[B,C,T,H,W]
+        latents = latents.permute(0, 2, 1, 3, 4)  # [batch_size, num_channels, num_frames, height, width]，调换上面的[B,T,C,H,W]
+        latents = 1 / self.vae_scaling_factor_image * latents # 逆向缩放潜变量，因为采样latent进入潜空间前进行了标准化，现在decode要恢复到原先的数值
 
-        frames = self.vae.decode(latents).sample
-        return frames
+        frames = self.vae.decode(latents).sample # 前向解码，提取存放RGB像素值的数据
+        return frames # [B, 3, T, H, W]
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):
@@ -663,8 +663,8 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             max_sequence_length=max_sequence_length,
             device=device,
         )
-        if do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        if do_classifier_free_guidance: # CFG要求网络进行两次预测：有文本条件的（正向）+无文本条件的（负向）,为了不让网络跑两次（浪费调用时间），工程上把两组数据在 Batch（批次，即 dim=0）维度拼在一起，让网络一次前向传播算完。
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0) # 在B维度拼接，顺序：前半部分负向，后半部分正向
 
         # 4. Prepare timesteps
         if XLA_AVAILABLE:
@@ -682,9 +682,9 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         # For CogVideoX 1.5, the latent frames should be padded to make it divisible by patch_size_t
         patch_size_t = self.transformer.config.patch_size_t
         additional_frames = 0
-        if patch_size_t is not None and latent_frames % patch_size_t != 0:
-            additional_frames = patch_size_t - latent_frames % patch_size_t
-            num_frames += additional_frames * self.vae_scale_factor_temporal
+        if patch_size_t is not None and latent_frames % patch_size_t != 0: # 对时间维度进行patchify前检查能否整除
+            additional_frames = patch_size_t - latent_frames % patch_size_t # 在latent中补几帧
+            num_frames += additional_frames * self.vae_scale_factor_temporal # 这里是Encoder前的帧数，所以latent中补的帧数要*时间下采样率
 
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
@@ -720,7 +720,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     continue
 
                 self._current_timestep = t
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # 噪声特征也和文本条件特征对齐
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
@@ -728,9 +728,9 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
                 # predict noise model_output
                 with self.transformer.cache_context("cond_uncond"):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        encoder_hidden_states=prompt_embeds,
+                    noise_pred = self.transformer( # DiT预测噪声,shape=[2B,16,T,H,W]
+                        hidden_states=latent_model_input, # 2B
+                        encoder_hidden_states=prompt_embeds, # 2B
                         timestep=timestep,
                         image_rotary_emb=image_rotary_emb,
                         attention_kwargs=attention_kwargs,
@@ -744,12 +744,12 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                         (1 - math.cos(math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
                     )
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2) # 无条件生成，有条件生成
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) # CFG公式
 
                 # compute the previous noisy sample x_t -> x_t-1
                 if not isinstance(self.scheduler, CogVideoXDPMScheduler):
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0] # 调度器更新
                 else:
                     latents, old_pred_original_sample = self.scheduler.step(
                         noise_pred,
@@ -783,7 +783,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         if not output_type == "latent":
             # Discard any padding frames that were added for CogVideoX 1.5
-            latents = latents[:, additional_frames:]
+            latents = latents[:, additional_frames:] # Batch维度保留，从新添加的帧开始取，取到序列末尾
             video = self.decode_latents(latents)
             video = self.video_processor.postprocess_video(video=video, output_type=output_type)
         else:
