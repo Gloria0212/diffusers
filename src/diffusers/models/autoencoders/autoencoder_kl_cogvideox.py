@@ -94,21 +94,20 @@ class CogVideoXCausalConv3d(nn.Module):
 
         # TODO(aryan): configure calculation based on stride and dilation in the future.
         # Since CogVideoX does not use it, it is currently tailored to "just work" with Mochi
-        time_pad = time_kernel_size - 1
-        height_pad = (height_kernel_size - 1) // 2
+        time_pad = time_kernel_size - 1 # 卷积后T维度尺寸不变，故-1，只补过去，不补未来
+        height_pad = (height_kernel_size - 1) // 2 # -1是因为卷积后尺寸不变，//2补两边，中心对称
         width_pad = (width_kernel_size - 1) // 2
 
         self.pad_mode = pad_mode
         self.height_pad = height_pad
         self.width_pad = width_pad
         self.time_pad = time_pad
-        self.time_causal_padding = (width_pad, width_pad, height_pad, height_pad, time_pad, 0)
-        self.const_padding_conv3d = (0, self.width_pad, self.height_pad)
-
-        self.temporal_dim = 2
+        self.time_causal_padding = (width_pad, width_pad, height_pad, height_pad, time_pad, 0) # W左右，H上下，T前后
+        self.const_padding_conv3d = (0, self.width_pad, self.height_pad) # nn.Conv无法处理不对称的拼接，因此时间维度不补0，前向传播时再手动补上
+        self.temporal_dim = 2 # 5D视频张量[Batch, Channel, Time, Height, Width]，明确时间维度的索引为2
         self.time_kernel_size = time_kernel_size
 
-        stride = stride if isinstance(stride, tuple) else (stride, 1, 1)
+        stride = stride if isinstance(stride, tuple) else (stride, 1, 1) # 确保stride是tuple形式
         dilation = (dilation, 1, 1)
         self.conv = CogVideoXSafeConv3d(
             in_channels=in_channels,
@@ -116,35 +115,35 @@ class CogVideoXCausalConv3d(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             dilation=dilation,
-            padding=0 if self.pad_mode == "replicate" else self.const_padding_conv3d,
-            padding_mode="zeros",
+            padding=0 if self.pad_mode == "replicate" else self.const_padding_conv3d, # replicate说明F.pad会把T,H,W三个维度复制补齐，不用再通过底层卷积层补了，所以补0个
+            padding_mode="zeros", # 不是replicate的话，要用上面定义的补齐方式self.const_padding_conv3d，且zeros模式，会直接传给卷积核self.conv
         )
 
-    def fake_context_parallel_forward(
-        self, inputs: torch.Tensor, conv_cache: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def fake_context_parallel_forward( # 在真正执行卷积之前，把当前输入的张量，和历史的缓存（或者复制的第一帧）在时间维度上拼接好
+        self, inputs: torch.Tensor, conv_cache: torch.Tensor | None = None # conv_cache，卷积缓存，保存了上一次计算留下的过去K-1帧张量特征
+    ) -> torch.Tensor: # conv_cache接受的数据类型可以是一个torch.Tensor对象，或者是None，默认是None（视频第一帧刚输入/非流式训练时，没有历史缓存）
         if self.pad_mode == "replicate":
             inputs = F.pad(inputs, self.time_causal_padding, mode="replicate")
-        else:
+        else: # 不是replicate模式，就在T维度做拼接，T维度长度变成(K-1)+T
             kernel_size = self.time_kernel_size
             if kernel_size > 1:
-                cached_inputs = [conv_cache] if conv_cache is not None else [inputs[:, :, :1]] * (kernel_size - 1)
-                inputs = torch.cat(cached_inputs + [inputs], dim=2)
+                cached_inputs = [conv_cache] if conv_cache is not None else [inputs[:, :, :1]] * (kernel_size - 1) # conv_cache不是None说明是在流式推理、有缓存，是None说明训练/推理刚启动，无缓存；inputs[:, :, :1]是提取当前输入视频索引为0的第1帧，前面两个冒号表示保留，后面的维度也全都保留，即shape为[B, C, 1, H, W]，T=1表示张量在时间维度上的长度为1
+                inputs = torch.cat(cached_inputs + [inputs], dim=2) # 历史帧列表和当前输入在dim=2时间维度拼接
         return inputs
 
     def forward(self, inputs: torch.Tensor, conv_cache: torch.Tensor | None = None) -> torch.Tensor:
-        inputs = self.fake_context_parallel_forward(inputs, conv_cache)
+        inputs = self.fake_context_parallel_forward(inputs, conv_cache) # 准备输入数据
 
         if self.pad_mode == "replicate":
             conv_cache = None
-        else:
-            conv_cache = inputs[:, :, -self.time_kernel_size + 1 :].clone()
-
+        else: # 将当前输入张量的最后K-1帧截取，保存为新的conv_cache，作为下一帧t+1输入时的历史数据
+            conv_cache = inputs[:, :, -self.time_kernel_size + 1 :].clone() # 如time_kernel_size=3，算出来就是-2，所有元素是[-3,-2,-1]，-2:表示时间维度上取倒数第二帧直到最后一帧
+                                                                    # clone()深拷贝，在GPU显存开一块全新独立的内存空间，将这两帧数据复制进去，让inputs计算完就能回收，流式推理的显存占用量极低。如果不加clone，则不会分配新内存，而是创建指向原始inputs的视图view，完整视频特征inputs一直在显存无法释放。
         output = self.conv(inputs)
-        return output, conv_cache
+        return output, conv_cache # 更新后的conv_cache
 
 
-class CogVideoXSpatialNorm3D(nn.Module):
+class CogVideoXSpatialNorm3D(nn.Module): # 空间条件归一化（其Scale和Shift不是常数，而是由另一个条件张量zq在空间和时间维度上逐像素计算出来的动态张量。）
     r"""
     Spatially conditioned normalization as defined in https://huggingface.co/papers/2209.09002. This implementation is
     specific to 3D-video like data.
@@ -162,36 +161,36 @@ class CogVideoXSpatialNorm3D(nn.Module):
 
     def __init__(
         self,
-        f_channels: int,
-        zq_channels: int,
+        f_channels: int, # 主干数据特征图f的通道数（f深层，分辨率大）
+        zq_channels: int, # 提供指导条件的张量zq的通道数（zq浅层，分辨率小，因此需要用F.interpolate把zq上采样放大到和f一样的3D尺寸）
         groups: int = 32,
     ):
         super().__init__()
-        self.norm_layer = nn.GroupNorm(num_channels=f_channels, num_groups=groups, eps=1e-6, affine=True)
-        self.conv_y = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1)
-        self.conv_b = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1)
+        self.norm_layer = nn.GroupNorm(num_channels=f_channels, num_groups=groups, eps=1e-6, affine=True) # True表示保留了全局可学习的权重和偏置
+        self.conv_y = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1) # 实例化1*1*1的因果卷积，负责把条件张量zq映射成用来做乘法的scale矩阵\gamma
+        self.conv_b = CogVideoXCausalConv3d(zq_channels, f_channels, kernel_size=1, stride=1) # 负责把条件张量zq映射成用来做加法的shift矩阵\beta
 
     def forward(
-        self, f: torch.Tensor, zq: torch.Tensor, conv_cache: dict[str, torch.Tensor] | None = None
+        self, f: torch.Tensor, zq: torch.Tensor, conv_cache: dict[str, torch.Tensor] | None = None # conv_cache作为字典，分别存放两个因果卷积的历史帧
     ) -> torch.Tensor:
-        new_conv_cache = {}
-        conv_cache = conv_cache or {}
+        new_conv_cache = {} # 接收t时刻计算后产生的新特征，执行完毕后作为t+1时刻的conv_cache再传入
+        conv_cache = conv_cache or {} # conv_cache有值就直接返回，空值就返回{}；是t-1时刻的特征缓存，只读不写
 
-        if f.shape[2] > 1 and f.shape[2] % 2 == 1:
-            f_first, f_rest = f[:, :, :1], f[:, :, 1:]
-            f_first_size, f_rest_size = f_first.shape[-3:], f_rest.shape[-3:]
+        if f.shape[2] > 1 and f.shape[2] % 2 == 1: # dim=2是T维度，总帧数一般是4N+1，奇数
+            f_first, f_rest = f[:, :, :1], f[:, :, 1:] # 剥离第一帧（比如zq时间维度是5，f时间维度是17，如果全量插值F.interpolate(size=17)，会将5帧均匀拉伸到17帧里，导致zq的第1帧发生时间偏移，破坏锚点帧的对齐）
+            f_first_size, f_rest_size = f_first.shape[-3:], f_rest.shape[-3:] # T,H,W
             z_first, z_rest = zq[:, :, :1], zq[:, :, 1:]
-            z_first = F.interpolate(z_first, size=f_first_size)
+            z_first = F.interpolate(z_first, size=f_first_size) # 对zq进行上采样放大
             z_rest = F.interpolate(z_rest, size=f_rest_size)
-            zq = torch.cat([z_first, z_rest], dim=2)
-        else:
-            zq = F.interpolate(zq, size=f.shape[-3:])
+            zq = torch.cat([z_first, z_rest], dim=2) # 将第一帧和剩余帧分别放大后，再拼接，这回zq在T上的维度和f保持一致了
+        else: # T=1，单张图片
+            zq = F.interpolate(zq, size=f.shape[-3:]) # 直接全局对齐，T,H,W，将小尺寸zq上采样去匹配大尺寸f，以便后续进行一对一的逐像素相乘
 
-        conv_y, new_conv_cache["conv_y"] = self.conv_y(zq, conv_cache=conv_cache.get("conv_y"))
-        conv_b, new_conv_cache["conv_b"] = self.conv_b(zq, conv_cache=conv_cache.get("conv_b"))
+        conv_y, new_conv_cache["conv_y"] = self.conv_y(zq, conv_cache=conv_cache.get("conv_y")) # 元组解包
+        conv_b, new_conv_cache["conv_b"] = self.conv_b(zq, conv_cache=conv_cache.get("conv_b")) # .get()把字典里对应名称的缓存取出，喂给卷积层
 
-        norm_f = self.norm_layer(f)
-        new_f = norm_f * conv_y + conv_b
+        norm_f = self.norm_layer(f) # groupnorm
+        new_f = norm_f * conv_y + conv_b # 用刚算出来的动态scale和shift进行逐像素的空间调制
         return new_f, new_conv_cache
 
 
