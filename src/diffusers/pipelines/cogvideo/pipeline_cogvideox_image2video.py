@@ -361,7 +361,7 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             )
 
         num_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        shape = (
+        shape = ( # B, T, C, H, W, 在DiT中更符合NLP处理时时间序列优先的习惯
             batch_size,
             num_frames,
             num_channels_latents,
@@ -373,34 +373,34 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         if self.transformer.config.patch_size_t is not None:
             shape = shape[:1] + (shape[1] + shape[1] % self.transformer.config.patch_size_t,) + shape[2:]
 
-        image = image.unsqueeze(2)  # [B, C, F, H, W]
+        image = image.unsqueeze(2)  # 静态图像视频化，在dim=2处加一个维度，[B, C=3, H, W] → [B, C=3, T=1, H, W]，以满足3D VAE的输入要求
 
         if isinstance(generator, list):
             image_latents = [
                 retrieve_latents(self.vae.encode(image[i].unsqueeze(0)), generator[i]) for i in range(batch_size)
-            ]
+            ] # 3DVAE进行特征提取和降维，[B, C=16, T=1, H/8, W/8]
         else:
             image_latents = [retrieve_latents(self.vae.encode(img.unsqueeze(0)), generator) for img in image]
 
-        image_latents = torch.cat(image_latents, dim=0).to(dtype).permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        image_latents = torch.cat(image_latents, dim=0).to(dtype).permute(0, 2, 1, 3, 4)  # 维度重排，张量shape从VAE默认的[B, C, T, H, W]变成DiT训练习惯的[B, T, C, H, W]
 
         if not self.vae.config.invert_scale_latents:
-            image_latents = self.vae_scaling_factor_image * image_latents
+            image_latents = self.vae_scaling_factor_image * image_latents # 工程修正
         else:
             # This is awkward but required because the CogVideoX team forgot to multiply the
             # scaling factor during training :)
             image_latents = 1 / self.vae_scaling_factor_image * image_latents
 
-        padding_shape = (
+        padding_shape = ( # padding之前，image_latents的shape=[B, T=1, C=16, H, W]，只有一张图
             batch_size,
-            num_frames - 1,
+            num_frames - 1, # 潜空间总帧数-1
             num_channels_latents,
-            height // self.vae_scale_factor_spatial,
-            width // self.vae_scale_factor_spatial,
+            height // self.vae_scale_factor_spatial, # 潜空间H
+            width // self.vae_scale_factor_spatial, # 潜空间W
         )
 
-        latent_padding = torch.zeros(padding_shape, device=device, dtype=dtype)
-        image_latents = torch.cat([image_latents, latent_padding], dim=1)
+        latent_padding = torch.zeros(padding_shape, device=device, dtype=dtype) # 生成全0张量
+        image_latents = torch.cat([image_latents, latent_padding], dim=1) # 和图像特征沿T维度拼接，这样T维度依然是总帧数
 
         # Select the first frame along the second dimension
         if self.transformer.config.patch_size_t is not None:
@@ -786,9 +786,9 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
 
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             device, dtype=prompt_embeds.dtype
-        )
+        ) # 图像预处理
 
-        latent_channels = self.transformer.config.in_channels // 2
+        latent_channels = self.transformer.config.in_channels // 2 # I2V模型中，DiT第一层要求的输入通道数in_channels为32
         latents, image_latents = self.prepare_latents(
             image,
             batch_size * num_videos_per_prompt,
@@ -813,7 +813,7 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         )
 
         # 8. Create ofs embeds if required
-        ofs_emb = None if self.transformer.config.ofs_embed_dim is None else latents.new_full((1,), fill_value=2.0)
+        ofs_emb = None if self.transformer.config.ofs_embed_dim is None else latents.new_full((1,), fill_value=2.0) # 动态强度缩放，新的条件控制参数，控制生成视频的运动幅度
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -826,12 +826,12 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
                     continue
 
                 self._current_timestep = t
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # CFG需要跑一次有条件、一次无条件，需要复制两份
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 latent_image_input = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
-                latent_model_input = torch.cat([latent_model_input, latent_image_input], dim=2)
-
+                latent_model_input = torch.cat([latent_model_input, latent_image_input], dim=2) # diffusers库中潜变量shape为[Batch, Frames, Channels, Height, Width]，所以dim=2指channels; 16通道噪声+16通道图像特征=32通道张量
+                                            # 16通道高斯噪声 + 16通道的带padding的图像特征（第一帧为图像）
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
