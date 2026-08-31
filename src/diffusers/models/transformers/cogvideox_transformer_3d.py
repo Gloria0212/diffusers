@@ -115,7 +115,7 @@ class CogVideoXBlock(nn.Module):
             bias=ff_bias,
         )
 
-    def forward(
+    def forward( # 每一层网络内部，时间步、文本、视频如何进行作用
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
@@ -126,33 +126,33 @@ class CogVideoXBlock(nn.Module):
         text_seq_length = encoder_hidden_states.size(1)
         attention_kwargs = attention_kwargs or {}
 
-        # norm & modulate
+        # norm & modulate 时间条件注入 AdaLN-Zero
         norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
             hidden_states, encoder_hidden_states, temb
-        )
+        ) # 传入视频hidden_states、文本encoder_hidden_states、时间步向量temb，返回归一化后的状态和控制残差连接强度的门控因子
 
-        # attention
+        # attention 联合注意力计算 Joint Attention
         attn_hidden_states, attn_encoder_hidden_states = self.attn1(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             **attention_kwargs,
-        )
+        ) # attn1底层的processor将文本和视频张量沿dim=1拼接，将拼接后的长序列乘以权重矩阵，进行self-attention，深度特征融合，计算完后再切分为视频输出和文本输出
 
-        hidden_states = hidden_states + gate_msa * attn_hidden_states
-        encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
+        hidden_states = hidden_states + gate_msa * attn_hidden_states # ResNet,gate_msa的初始值为0(AdaLN-Zero)，等价于恒等映射
+        encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states # 对文本特征进行ResNet
 
         # norm & modulate
         norm_hidden_states, norm_encoder_hidden_states, gate_ff, enc_gate_ff = self.norm2(
             hidden_states, encoder_hidden_states, temb
         )
 
-        # feed-forward
-        norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+        # feed-forward 联合前馈神经网络 Joint FFN
+        norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1) # 文本特征和视频特征在序列维度拼接
         ff_output = self.ff(norm_hidden_states)
 
-        hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
-        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
+        hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:] # 对视频特征进行ResNet
+        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length] # 对文本特征进行ResNet
 
         return hidden_states, encoder_hidden_states
 
@@ -366,8 +366,8 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
     @apply_lora_scale("attention_kwargs")
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor, # 视频潜变量序列
+        encoder_hidden_states: torch.Tensor, # 提取的T5文本特征序列
         timestep: int | float | torch.LongTensor,
         timestep_cond: torch.Tensor | None = None,
         ofs: int | float | torch.LongTensor | None = None,
@@ -404,7 +404,7 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        batch_size, num_frames, channels, height, width = hidden_states.shape
+        batch_size, num_frames, channels, height, width = hidden_states.shape # [B, T, C, H, W]
 
         # 1. Time embedding
         timesteps = timestep
@@ -423,15 +423,15 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
             emb = emb + ofs_emb
 
         # 2. Patch embedding
-        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
-        hidden_states = self.embedding_dropout(hidden_states)
+        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states) # 分别将T5文本向量、视频潜变量patchify展平后，映射到transformer的inner_dim，加上各自的位置编码，并沿着序列为度将文本序列与视频序列物理拼接。
+        hidden_states = self.embedding_dropout(hidden_states) # nn.dropout
 
-        text_seq_length = encoder_hidden_states.shape[1]
-        encoder_hidden_states = hidden_states[:, :text_seq_length]
-        hidden_states = hidden_states[:, text_seq_length:]
+        text_seq_length = encoder_hidden_states.shape[1] # T5文本特征向量的dim=1序列维度，取出长度，作为切分文本和视频的界限
+        encoder_hidden_states = hidden_states[:, :text_seq_length] # 切片，保留batch维度，在序列维度切出加了位置编码后的文本部分
+        hidden_states = hidden_states[:, text_seq_length:] # 剩下的视频部分（拼起来又切开的原因：拼起来是因为要在patch_embed内部统一处理维度和位置编码，切开是因为后面文本和视频需要接收不同的adaLN缩放参数，不能在同一个参数下进行归一化）
 
         # 3. Transformer blocks
-        for i, block in enumerate(self.transformer_blocks):
+        for i, block in enumerate(self.transformer_blocks): 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
                     block,
